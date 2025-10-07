@@ -32,8 +32,7 @@ In order to enable **real-time depth perception** on a low budget, we designed a
     - UDP streams from both cameras are sent simultaneously to the ground station (server PC).
 
 <p align="center">
-  <img src="VTX_test.gif" alt="trx" width="300"/>
-  <img src="trx_test.gif" alt="trx" width="300"/>
+  <img src="VTX_test.gif" alt="trx" width="600"/>
 </p>
 
 ---
@@ -47,6 +46,10 @@ In order to enable **real-time depth perception** on a low budget, we designed a
     - If chunks are missing, a **Gaussian patching algorithm** reconstructs the missing pixel regions, minimizing frame drops.
 3. **Stereo Stream Output**
     - Once reconstructed, frames are published as **synchronized stereo image topics**, ready for integration with **depth estimation, point cloud generation, and SLAM pipelines**.
+
+<p align="center">
+  <img src="trx_test.gif" alt="trx" width="600"/>
+</p>
 
 ---
 
@@ -63,7 +66,10 @@ In order to enable **real-time depth perception** on a low budget, we designed a
 - **Robust UAV Autonomy**
     
     Enables operation in **GPS-denied** or cluttered environments.
-    
+
+<p align="center">
+  <img src="stereo_cam_comp.gif" alt="stereo" width="600"/>
+</p>
 
 ---
 
