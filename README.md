@@ -16,8 +16,8 @@ In order to enable **real-time depth perception** on a low budget, we designed a
     - A hardware pulse was generated to **trigger both cameras simultaneously**, ensuring **no temporal offset** between stereo frames.
 
 <p align="center">
-  <img src="Stereo_camera_mount_board.png" alt="PCB" width="400"/>
-  <img src="Stereo_board_front.png" alt="PCB" width="400"/>
+  <img src="Stereo_camera_mount_board.png" alt="PCB" width="300"/>
+  <img src="Stereo_board_front.png" alt="PCB" width="300"/>
 </p>
 
 ---
@@ -30,6 +30,11 @@ In order to enable **real-time depth perception** on a low budget, we designed a
 2. **Networking Setup**
     - Each ESP32 connects to a **router with a dedicated IP**.
     - UDP streams from both cameras are sent simultaneously to the ground station (server PC).
+
+<p align="center">
+  <img src="VTX_test.gif" alt="trx" width="300"/>
+  <img src="trx_test.gif" alt="trx" width="300"/>
+</p>
 
 ---
 
