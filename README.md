@@ -15,6 +15,11 @@ In order to enable **real-time depth perception** on a low budget, we designed a
 3. **Synchronized Capture Trigger**
     - A hardware pulse was generated to **trigger both cameras simultaneously**, ensuring **no temporal offset** between stereo frames.
 
+<p align="center">
+  <img src="Stereo_camera_mount_board.png" alt="PCB" width="300"/>
+  <img src="Stereo_board_front.png" alt="PCB" width="300"/>
+</p>
+
 ---
 
 ## 📡 Firmware & Transmission
