@@ -1,5 +1,3 @@
-# Untitled
-
 # 📷 Custom Low-Cost Stereo Depth Camera Setup (Project Bee)
 
 In order to enable **real-time depth perception** on a low budget, we designed and built a **custom stereo vision camera** using off-the-shelf ESP32-S3 modules and OV5640 sensors. This system serves as the backbone for our UAV’s onboard depth estimation pipeline, integrated into **Project Bee**.
