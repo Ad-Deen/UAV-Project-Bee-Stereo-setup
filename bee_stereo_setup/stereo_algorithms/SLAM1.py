@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+import cv2
+import numpy as np
+import tensorrt as trt
+import pycuda.driver as cuda
+import pycuda.autoinit
+import time
+import open3d as o3d
+from message_filters import Subscriber, ApproximateTimeSynchronizer
+
+
+map_db = {}
+
+# ======================= SLAM UTILS =======================
+
+def detect_features(frame, max_features=50):
+    """
+    Detects feature points in a frame using AKAZE.
+    Draws green dots on the detected points in the input frame.
+    Returns:
+        pts_2d: Nx2 array of pixel coordinates
+        descriptors: NxD descriptor array
+        keypoints: list of cv2.KeyPoint objects
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    akaze = cv2.AKAZE_create()
+    keypoints, descriptors = akaze.detectAndCompute(gray, None)
+
+    # Limit to max_features if specified
+    if len(keypoints) > max_features:
+        keypoints = keypoints[:max_features]
+        descriptors = descriptors[:max_features]
+
+    # Draw green dots on the frame
+    for kp in keypoints:
+        u, v = int(kp.pt[0]), int(kp.pt[1])
+        cv2.circle(frame, (u, v), 3, (0, 255, 0), -1)
+
+    # Convert to numpy array of (u,v)
+    pts_2d = np.array([kp.pt for kp in keypoints], dtype=np.float32)
+
+    return pts_2d, descriptors
+
+def backproject_2d_to_3d(pts_2d, depth_map, fx, fy, cx, cy, descriptors=None):
+    pts_3d = []
+    valid_2d = []
+    valid_desc = []
+    for i, (u, v) in enumerate(pts_2d):
+        z = depth_map[int(v), int(u)]
+        if z <= 0:
+            continue
+        x = (u - cx) * z / fx
+        y = (v - cy) * z / fy
+        pts_3d.append([x, y, z])
+        valid_2d.append([u, v])
+        if descriptors is not None:
+            valid_desc.append(descriptors[i])
+    pts_3d = np.array(pts_3d, dtype=np.float32)
+    valid_2d = np.array(valid_2d, dtype=np.float32)
+    valid_desc = np.array(valid_desc) if descriptors is not None else None
+    return pts_3d, valid_2d, valid_desc
+
+
+def store_keyframe(key_id, pose, pts_2d, pts_3d, descriptors):
+    """
+    Stores a keyframe in the map.
+    """
+    map_db[key_id] = {
+        "pose": pose,
+        "pts_2d": pts_2d,
+        "pts_3d": pts_3d,
+        "descriptors": descriptors
+    }
+
+def match_to_keyframe(frame, key_id, map_db):
+    """
+    Matches incoming frame features to saved keyframe features.
+    Returns matched 2D points (current frame) and 3D landmarks (from map).
+    """
+    pts_2d_new, desc_new = detect_features(frame)
+    if desc_new is None:
+        return np.empty((0, 2)), np.empty((0, 3))
+
+    # Load keyframe data
+    keyframe = map_db[key_id]
+    desc_ref = keyframe["descriptors"]
+    pts_3d_ref = keyframe["pts_3d"]
+
+    # Match descriptors
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(desc_new, desc_ref)
+    matches = sorted(matches, key=lambda x: x.distance)
+
+    matched_2d = []
+    matched_3d = []
+    for m in matches:
+        matched_2d.append(pts_2d_new[m.queryIdx])
+        matched_3d.append(pts_3d_ref[m.trainIdx])
+
+    return np.array(matched_2d), np.array(matched_3d)
+
+def local_rematch(gray_img, tracked_pts, keyframe, radius=10):
+    """
+    Recomputes descriptors in a local region around tracked points
+    and matches them with the saved keyframe descriptors.
+
+    Args:
+        gray_img (np.ndarray): current grayscale image
+        tracked_pts (Nx2): tracked feature positions from optical flow
+        keyframe (dict): stored keyframe with "pts_3d" and "descriptors"
+        radius (int): search window radius in pixels
+
+    Returns:
+        matched_2D (Nx2), matched_3D (Nx3)
+    """
+    akaze = cv2.AKAZE_create()
+    matched_2D, matched_3D = [], []
+
+    # Crop small patches around tracked points
+    for i, (u, v) in enumerate(tracked_pts):
+        u, v = int(u), int(v)
+
+        # Extract patch safely
+        x0, x1 = max(0, u - radius), min(gray_img.shape[1], u + radius)
+        y0, y1 = max(0, v - radius), min(gray_img.shape[0], v + radius)
+        patch = gray_img[y0:y1, x0:x1]
+
+        if patch.size == 0:
+            continue
+
+        # Detect features in patch
+        kps, desc = akaze.detectAndCompute(patch, None)
+        if desc is None or len(kps) == 0:
+            continue
+
+        # Shift kp coords back into full image
+        pts_patch = np.array([[kp.pt[0] + x0, kp.pt[1] + y0] for kp in kps], dtype=np.float32)
+
+        # Match patch descriptors to keyframe
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matches = bf.match(desc, keyframe["descriptors"])
+
+        if len(matches) == 0:
+            continue
+
+        best_match = min(matches, key=lambda m: m.distance)
+
+        matched_2D.append(pts_patch[best_match.queryIdx])
+        matched_3D.append(keyframe["pts_3d"][best_match.trainIdx])
+
+    return np.array(matched_2D, dtype=np.float32), np.array(matched_3D, dtype=np.float32)
+
+# ==============================================================
+
+# ======================== o3D Viz ========================
+class O3DVisualizerNonBlocking:
+    def __init__(self, window_name="Test PointCloud", width=800, height=600):
+        self.vis = o3d.visualization.VisualizerWithKeyCallback()
+        self.vis.create_window(window_name, width=width, height=height)
+        self.pcd = o3d.geometry.PointCloud()
+        self.vis.add_geometry(self.pcd)
+        self.first_update = True
+        self.should_close = False
+
+        # Set up key callback for ESC key
+        self.vis.register_key_callback(256, self._on_escape)  # ESC key
+
+        # Get render option and set point size
+        render_option = self.vis.get_render_option()
+        render_option.point_size = 2.0
+
+    def _on_escape(self, vis):
+        self.should_close = True
+        return False
+
+    def update(self, points: np.ndarray, colors: np.ndarray = None):
+        # points: (N,3), colors: (N,3) in [0..1]
+        if points is None or points.size == 0 or self.should_close:
+            return False
+
+        try:
+            pts = points.astype(np.float64).reshape(-1, 3)
+            self.pcd.points = o3d.utility.Vector3dVector(pts)
+
+            if colors is not None and colors.shape[0] == pts.shape[0]:
+                cols = colors.astype(np.float64).reshape(-1, 3)
+                cols = np.clip(cols, 0.0, 1.0)
+                self.pcd.colors = o3d.utility.Vector3dVector(cols)
+            else:
+                self.pcd.colors = o3d.utility.Vector3dVector(np.ones_like(pts) * 0.7)
+
+            self.vis.update_geometry(self.pcd)
+
+            if self.first_update:
+                self.vis.reset_view_point(True)
+                self.first_update = False
+
+            # return True while running
+            return self.vis.poll_events() and not self.should_close
+
+        except Exception as e:
+            print(f"Error in O3D update: {e}")
+            return False
+
+    def close(self):
+        try:
+            self.vis.destroy_window()
+        except Exception:
+            pass
+# ======================== o3D Viz End ========================
+
+ENGINE_PATH = "/home/deen/ONNX-CREStereo-Depth-Estimation/models/iter20/crestereo_iter20_240x320.plan"
+BATCH = 1
+IMG_H, IMG_W = 240, 320
+INIT_H, INIT_W = IMG_H // 2, IMG_W // 2
+
+def preprocess_image_cv(img, H, W):
+    img = cv2.resize(img, (W, H), interpolation=cv2.INTER_AREA)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
+    img = np.transpose(img, (2, 0, 1))[np.newaxis, ...]   # NCHW
+    return np.ascontiguousarray(img)
+
+def colorize_disparity(disp):
+    disp_min, disp_max = disp.min(), disp.max()
+    disp_norm = (disp - disp_min) / 50.0
+    return cv2.applyColorMap((disp_norm * 255).astype(np.uint8), cv2.COLORMAP_MAGMA)
+
+class CreStereoNode(Node):
+    def __init__(self):
+        super().__init__("crestereo_infer_node")
+
+        self.bridge = CvBridge()
+
+        # --- message_filters subscribers (synchronized callback) ---
+        left_sub  = Subscriber(self, Image, "/automama/camera2")
+        right_sub = Subscriber(self, Image, "/automama/camera1")
+        # use Exact TimeSynchronizer if stamps are identical, else Approximate
+        ats = ApproximateTimeSynchronizer([left_sub, right_sub], queue_size=10, slop=0.01)
+        ats.registerCallback(self.stereo_callback)
+
+        # --- Load TensorRT engine ---
+        TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+        runtime = trt.Runtime(TRT_LOGGER)
+        with open(ENGINE_PATH, "rb") as f:
+            engine_data = f.read()
+        self.engine = runtime.deserialize_cuda_engine(engine_data)
+        self.context_trt = self.engine.create_execution_context()
+        self.stream = cuda.Stream()
+
+        # Allocate buffers (host pointers still in your pattern)
+        self.output = np.empty((BATCH, 2, IMG_H, IMG_W), dtype=np.float32)
+        self.d_output = cuda.mem_alloc(self.output.nbytes)
+        self.d_init_left  = cuda.mem_alloc(BATCH * 3 * INIT_H * INIT_W * 4)
+        self.d_init_right = cuda.mem_alloc(BATCH * 3 * INIT_H * INIT_W * 4)
+        self.d_next_left  = cuda.mem_alloc(BATCH * 3 * IMG_H * IMG_W * 4)
+        self.d_next_right = cuda.mem_alloc(BATCH * 3 * IMG_H * IMG_W * 4)
+
+        # set tensor addresses
+        self.context_trt.set_tensor_address("init_left", int(self.d_init_left))
+        self.context_trt.set_tensor_address("init_right", int(self.d_init_right))
+        self.context_trt.set_tensor_address("next_left", int(self.d_next_left))
+        self.context_trt.set_tensor_address("next_right", int(self.d_next_right))
+        self.context_trt.set_tensor_address("next_output", int(self.d_output))
+
+        # Global state
+        self.keyframe_initialized = False
+        self.prev_gray = None
+        self.prev_pts = None
+        self.frame_count = 0
+        self.track_interval = 10   # every 10 frames, do local re-matching
+        self.boundary_ratio = 0.9
+
+        # Camera intrinsics (adjust if known)
+        self.cx = IMG_W / 2.0
+        self.cy = IMG_H / 2.0
+        self.focal_length = 125.0
+        self.baseline = 0.07
+        self.u, self.v = np.meshgrid(np.arange(IMG_W), np.arange(IMG_H))
+
+        self.K = np.array([[self.focal_length, 0, self.cx],
+              [0, self.focal_length, self.cy],
+              [0, 0, 1]], dtype=np.float32)
+        
+        # Open3D visualizer
+        self.vis = O3DVisualizerNonBlocking(window_name="CREStereo Depth PointCloud", width=800, height=600)
+
+        self.get_logger().info("CreStereoNode initialized and waiting for synchronized stereo frames...")
+
+    def run_inference(self, left_full, right_full, left_half, right_half):
+        # left_* etc are contiguos numpy arrays NCHW float32
+        cuda.memcpy_htod_async(self.d_init_left, left_half, self.stream)
+        cuda.memcpy_htod_async(self.d_init_right, right_half, self.stream)
+        cuda.memcpy_htod_async(self.d_next_left, left_full, self.stream)
+        cuda.memcpy_htod_async(self.d_next_right, right_full, self.stream)
+
+        self.context_trt.execute_async_v3(self.stream.handle)
+        cuda.memcpy_dtoh_async(self.output, self.d_output, self.stream)
+        self.stream.synchronize()
+        return np.squeeze(self.output[:, 0, :, :])
+
+    def stereo_callback(self, left_msg, right_msg):
+        """Called with synchronized pair (left_msg, right_msg). Do full pipeline here."""
+        start = time.perf_counter()
+
+        # Convert sensor_msgs -> cv2 images (BGR)
+        try:
+            left_img  = self.bridge.imgmsg_to_cv2(left_msg,  "bgr8")
+            right_img = self.bridge.imgmsg_to_cv2(right_msg, "bgr8")
+        except Exception as e:
+            self.get_logger().error(f"cv bridge error: {e}")
+            return
+
+        # Preprocess for model (both full and half sizes)
+        left_full  = preprocess_image_cv(left_img, IMG_H, IMG_W)
+        right_full = preprocess_image_cv(right_img, IMG_H, IMG_W)
+        left_half  = preprocess_image_cv(left_img, INIT_H, INIT_W)
+        right_half = preprocess_image_cv(right_img, INIT_H, INIT_W)
+
+        # Run TRT inference
+        disp_map = self.run_inference(left_full, right_full, left_half, right_half)
+
+        # Mask invalid disparity (avoid divide by zero)
+        valid_mask = (disp_map > 2.0) & (disp_map < 60.0)
+
+        # Compute depth
+        depth = np.zeros_like(disp_map, dtype=np.float32)
+        depth[valid_mask] = (self.focal_length * self.baseline) / disp_map[valid_mask]
+
+        # # Visualization prep
+        # depth_vis = np.clip(depth, 0.02, 10.0)
+        # # normalize for color map (avoid division by zero)
+        # if np.nanmax(depth_vis) > 0:
+        #     depth_vis_norm = (depth_vis / np.nanmax(depth_vis)).astype(np.float32)
+        # else:
+        #     depth_vis_norm = depth_vis.astype(np.float32)
+        # depth_color = cv2.applyColorMap((depth_vis_norm * 255).astype(np.uint8), cv2.COLORMAP_MAGMA)
+
+        # # Show left + depth side-by-side
+        # left_vis = cv2.resize(left_img, (depth_color.shape[1], depth_color.shape[0]))
+        # combined = np.hstack((left_vis, depth_color))
+        # cv2.imshow("Stereo Depth", combined)
+        # cv2.waitKey(1)
+
+        # # Build point cloud
+        # X = (self.u - self.cx) * depth / self.focal_length
+        # Y = (self.v - self.cy) * depth / self.focal_length
+        # Z = depth
+
+        # points = np.stack((X, Y, Z), axis=-1).reshape(-1, 3)
+        # colors = cv2.cvtColor(left_img, cv2.COLOR_BGR2RGB)
+        # colors = cv2.resize(colors, (IMG_W, IMG_H)).reshape(-1, 3) / 255.0
+        # z_flat = Z.reshape(-1)
+
+        # # Valid mask (same mask used for depth)
+        # mask = (z_flat > 0.02) & np.isfinite(z_flat)
+        # points = points[mask]
+        # colors = colors[mask]
+        
+        # if points.shape[0] > 0:
+        #     try:
+        #         # update visualizer (non-blocking)
+        #         self.vis.update(points, colors)
+        #     except Exception as e:
+        #         self.get_logger().warn(f"O3D update failed: {e}")
+        # else:
+        #     self.get_logger().info("No valid 3D points in this frame.")
+        
+        self.get_logger().info(f"Inference loop: {time.perf_counter()-start:.4f} sec")
+        left_resized = cv2.resize(left_img, (IMG_W, IMG_H))
+        gray = cv2.cvtColor(left_resized, cv2.COLOR_BGR2GRAY)
+
+        if not self.keyframe_initialized:
+            # 1️⃣ Detect initial keyframe features
+            feat2D, descriptors = detect_features(left_resized, max_features=200)
+
+            # 2️⃣ Backproject to 3D
+            feat3D, feat2D_valid, desc_valid = backproject_2d_to_3d(
+                feat2D, depth, self.focal_length, self.focal_length, self.cx, self.cy, descriptors
+            )
+
+            # 3️⃣ Store keyframe
+            store_keyframe("keyframe_1", np.eye(4), feat2D_valid, feat3D, desc_valid)
+
+            # Initialize tracker state
+            self.prev_gray = gray
+            self.prev_pts = feat2D_valid.reshape(-1, 1, 2)
+            self.keyframe_initialized = True
+
+            self.get_logger().info(f"Keyframe initialized with {feat2D_valid.shape[0]} points.")
+
+        else:
+            self.frame_count += 1
+
+            # 4️⃣ Optical flow tracking (LK)
+            next_pts, status, err = cv2.calcOpticalFlowPyrLK(
+                self.prev_gray, gray, self.prev_pts, None,
+                winSize=(21, 21), maxLevel=3,
+                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
+            )
+
+            # Keep only valid tracked points
+            good_new = next_pts[status == 1]
+            good_old = self.prev_pts[status == 1]
+
+            # 5️⃣ Boundary check (remove points near image border)
+            h, w = gray.shape
+            inside_mask = (
+                (good_new[:, 0] > 0) & (good_new[:, 0] < self.boundary_ratio * w) &
+                (good_new[:, 1] > 0) & (good_new[:, 1] < self.boundary_ratio * h)
+            )
+            good_new = good_new[inside_mask]
+            good_old = good_old[inside_mask]
+
+            # 6️⃣ Local descriptor re-matching every N frames
+            if self.frame_count % self.track_interval == 0:
+                matched_2D, matched_3D = local_rematch(
+                    gray, good_new, map_db["keyframe_1"], radius=10
+                )
+                self.get_logger().info(
+                    f"Frame {self.frame_count}: local rematch found {matched_2D.shape[0]} inliers."
+                )
+            else:
+                matched_2D = good_new
+                matched_3D = map_db["keyframe_1"]["pts_3d"][:len(good_new)]  # assume aligned order
+
+            # 7️⃣ Update state
+            self.prev_gray = gray
+            self.prev_pts = good_new.reshape(-1, 1, 2)
+
+            # Debug draw
+            for pt in good_new:
+                u, v = int(pt[0]), int(pt[1])
+                cv2.circle(left_resized, (u, v), 3, (0, 255, 0), -1)
+
+            self.get_logger().info(f"Tracking {good_new.shape[0]} points.")
+        
+            cv2.imshow("Tracked Features", left_resized)
+            cv2.waitKey(1)
+            # =============================== PCD Visualization ===============================
+            # if matched_3D.shape[0] > 0:
+            #     try:
+            #         # update visualizer (non-blocking)
+            #         self.vis.update(matched_3D, left_resized)
+            #     except Exception as e:
+            #         self.get_logger().warn(f"O3D update failed: {e}")
+            # else:
+            #     self.get_logger().info("No valid 3D points in this frame.")
+            # ======================================================
+            # 8️⃣ Solve PnP using RANSAC for outlier rejection
+            if matched_2D.shape[0] >= 4:  # PnP requires at least 4 points, 6+ is safer
+                success, rvec, tvec, inliers = cv2.solvePnPRansac(
+                    matched_3D.astype(np.float32),
+                    matched_2D.astype(np.float32),
+                    self.K, None,
+                    flags=cv2.SOLVEPNP_ITERATIVE,
+                    reprojectionError=3.0,
+                    iterationsCount=100
+                )
+
+                if success:
+                    # Convert to pose matrix
+                    R, _ = cv2.Rodrigues(rvec)
+                    T = np.hstack((R, tvec))
+                    T = np.vstack((T, [0, 0, 0, 1]))
+
+                    # 9️⃣ Extract translation + Euler angles
+                    tx, ty, tz = tvec.flatten()
+                    rx, ry, rz = cv2.RQDecomp3x3(R)[0]  # gives rotation in degrees
+
+                    self.get_logger().info(
+                        f"Pose: tx={tx:.3f}, ty={ty:.3f}, tz={tz:.3f}, "
+                        f"rx={rx:.2f}, ry={ry:.2f}, rz={rz:.2f}"
+                    )
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = CreStereoNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # cleanup
+        node.vis.close()
+        node.destroy_node()
+        cv2.destroyAllWindows()
+        rclpy.shutdown()
+
+if __name__ == "__main__":
+    main()
